@@ -428,7 +428,7 @@ pub fn next_instance_soid(document: &Value) -> Option<u64> {
     (GENERATED_INSTANCE_SOID_START..).find(|candidate| !used.contains(candidate))
 }
 
-fn inferred_item_level(document: &Value, character_index: usize) -> i64 {
+pub fn inferred_item_level(document: &Value, character_index: usize) -> i64 {
     document
         .pointer(&format!("/state/characters/{character_index}/equipment"))
         .and_then(Value::as_object)
@@ -495,6 +495,52 @@ pub fn equip_definition(
     Ok(())
 }
 
+/// Swaps whatever is equipped for an item parked in one of the slot's
+/// inventory boxes, and hands back what was equipped. The slot keeps the
+/// instance it already had, so the parked copy carries no SOID of its own and
+/// nothing outside the document can collide with one inside it.
+pub fn swap_equipped(
+    document: &mut Value,
+    character_index: usize,
+    slot: &str,
+    incoming: Option<Value>,
+) -> Result<Option<Value>, String> {
+    let pointer = format!("/state/characters/{character_index}/equipment/{slot}");
+    let outgoing = match document.pointer(&pointer) {
+        Some(Value::Object(_)) => document.pointer(&pointer).cloned(),
+        Some(Value::Null) | None => None,
+        Some(_) => {
+            return Err(format!(
+                "The {} slot contains unexpected data and was not changed",
+                slot_label(slot)
+            ));
+        }
+    };
+    let Some(mut incoming) = incoming else {
+        set_weapon_slot_empty(document, character_index, slot)?;
+        return Ok(outgoing);
+    };
+
+    let instance = outgoing
+        .as_ref()
+        .and_then(|item| item.get("instance_soid").cloned())
+        .or_else(|| {
+            next_instance_soid(document).map(|soid| Value::String(format!("0x{soid:016X}")))
+        })
+        .ok_or("Could not allocate a unique instance SOID for the selected item")?;
+    let object = incoming.as_object_mut().ok_or_else(|| {
+        format!("The item held for the {} slot is not an object", slot_label(slot))
+    })?;
+    object.insert("instance_soid".into(), instance);
+
+    let equipment = document
+        .pointer_mut(&format!("/state/characters/{character_index}/equipment"))
+        .and_then(Value::as_object_mut)
+        .ok_or("The selected character has no equipment object")?;
+    equipment.insert(slot.into(), incoming);
+    Ok(outgoing)
+}
+
 pub fn set_weapon_slot_empty(
     document: &mut Value,
     character_index: usize,
@@ -523,29 +569,57 @@ pub fn set_weapon_slot_empty(
 }
 
 /// Installs (or clears) one socket, materializing default plugs first so an
-/// untouched item keeps the rest of its package defaults.
-pub fn set_plug(
-    document: &mut Value,
-    character_index: usize,
-    slot: &str,
+/// untouched item keeps the rest of its package defaults. It works on a single
+/// equipment entry rather than on a slot of the document, because an item
+/// waiting in an inventory box is edited the same way as an equipped one.
+pub fn set_item_plug(
+    item: &mut Value,
     socket_index: usize,
     defaults: &[Option<String>],
     hash: Option<u64>,
 ) -> Result<(), String> {
-    let plugs = document
-        .pointer_mut(&format!("/state/characters/{character_index}/equipment/{slot}/plugs"))
-        .ok_or_else(|| format!("Missing plugs value for {slot}"))?;
+    let object = item.as_object_mut().ok_or("That item has no plugs to change")?;
+    let plugs = object.entry("plugs").or_insert(Value::Null);
     if plugs.is_null() {
         *plugs = Value::Array(default_plug_values(defaults));
     }
-    let plugs = plugs
-        .as_array_mut()
-        .ok_or_else(|| format!("Invalid plugs value for {slot}"))?;
+    let plugs = plugs.as_array_mut().ok_or("That item's plugs are not a list")?;
     while plugs.len() <= socket_index {
         plugs.push(Value::Null);
     }
     plugs[socket_index] = hash.map(format_hash).map_or(Value::Null, Value::String);
     Ok(())
+}
+
+/// Points an equipment entry at a definition, with that definition's package
+/// defaults in its sockets. A null entry becomes a whole item at `level`; it
+/// gets an instance SOID from the slot it is later swapped into.
+pub fn set_item_definition(
+    item: &mut Value,
+    definition_hash: u64,
+    defaults: &[Option<String>],
+    level: i64,
+) -> Result<(), String> {
+    if u32::try_from(definition_hash).is_err() {
+        return Err("Cannot hold an invalid definition hash".to_owned());
+    }
+    match item {
+        Value::Object(object) => {
+            object.insert("definition_hash".into(), Value::String(format_hash(definition_hash)));
+            object.insert("plugs".into(), Value::Array(default_plug_values(defaults)));
+            Ok(())
+        }
+        Value::Null => {
+            *item = serde_json::json!({
+                "definition_hash": format_hash(definition_hash),
+                "level": level,
+                "quantity": 1,
+                "plugs": default_plug_values(defaults),
+            });
+            Ok(())
+        }
+        _ => Err("That item is not an object and was not changed".to_owned()),
+    }
 }
 
 /// Armor from each class already in the file, used when switching a character's
@@ -629,10 +703,75 @@ mod tests {
     }
 
     #[test]
+    fn an_item_can_be_built_and_edited_before_it_is_ever_equipped() {
+        let defaults = vec![Some("0x11111111".into()), Some("0x22222222".into())];
+        let mut held = Value::Null;
+        set_item_definition(&mut held, 0x0000_BEEF, &defaults, 106).unwrap();
+        set_item_plug(&mut held, 1, &defaults, Some(0x3333_3333)).unwrap();
+        assert_eq!(held["definition_hash"], "0x0000BEEF");
+        assert_eq!(held["plugs"], serde_json::json!(["0x11111111", "0x33333333"]));
+        // The instance comes from the slot it lands in, not from the item.
+        assert!(held.get("instance_soid").is_none());
+
+        let mut document = document();
+        swap_equipped(&mut document, 0, "kinetic", Some(held)).unwrap();
+        let equipped = document.pointer("/state/characters/0/equipment/kinetic").unwrap();
+        assert_eq!(equipped["instance_soid"], "0x0000000000000001");
+        assert_eq!(equipped["plugs"], serde_json::json!(["0x11111111", "0x33333333"]));
+    }
+
+    #[test]
+    fn swapping_an_item_in_keeps_the_instance_the_slot_already_had() {
+        let mut document = document();
+        let parked = serde_json::json!({
+            "instance_soid": "0x00000000000000FF",
+            "definition_hash": "0x0000BEEF",
+            "level": 106,
+            "quantity": 1,
+            "plugs": null
+        });
+
+        let outgoing = swap_equipped(&mut document, 0, "kinetic", Some(parked)).unwrap();
+        let equipped = document.pointer("/state/characters/0/equipment/kinetic").unwrap();
+        assert_eq!(equipped.get("definition_hash").unwrap(), "0x0000BEEF");
+        // The instance belongs to the slot, not to the item passing through it.
+        assert_eq!(equipped.get("instance_soid").unwrap(), "0x0000000000000001");
+        assert_eq!(
+            outgoing.as_ref().and_then(|item| item.get("definition_hash")).unwrap(),
+            "0x0000ABCD"
+        );
+
+        // Swapping back leaves the slot exactly as it started.
+        swap_equipped(&mut document, 0, "kinetic", outgoing).unwrap();
+        assert_eq!(document, self::document());
+    }
+
+    #[test]
+    fn swapping_an_empty_box_in_can_only_empty_a_weapon_slot() {
+        let mut document = document();
+        document["state"]["characters"][0]["equipment"]["ghost"] = serde_json::json!({
+            "instance_soid": "0x0000000000000002",
+            "definition_hash": "0x0000FEED",
+            "level": 106,
+            "quantity": 1,
+            "plugs": null
+        });
+        let before = document.clone();
+
+        assert!(swap_equipped(&mut document, 0, "ghost", None).is_err());
+        assert_eq!(document, before, "a refused swap must not touch the document");
+
+        let outgoing = swap_equipped(&mut document, 0, "kinetic", None).unwrap();
+        assert!(outgoing.is_some());
+        assert!(document.pointer("/state/characters/0/equipment/kinetic").unwrap().is_null());
+    }
+
+    #[test]
     fn setting_a_plug_materializes_the_package_defaults_first() {
         let mut document = document();
         let defaults = vec![Some("0x11111111".into()), None, Some("0x33333333".into())];
-        set_plug(&mut document, 0, "kinetic", 1, &defaults, Some(0x2222_2222)).unwrap();
+        let item = document.pointer_mut("/state/characters/0/equipment/kinetic").unwrap();
+        set_item_plug(item, 1, &defaults, Some(0x2222_2222)).unwrap();
         assert_eq!(
             document.pointer("/state/characters/0/equipment/kinetic/plugs"),
             Some(&serde_json::json!(["0x11111111", "0x22222222", "0x33333333"]))
@@ -643,7 +782,8 @@ mod tests {
     fn clearing_a_plug_writes_null_without_shortening_the_array() {
         let mut document = document();
         let defaults = vec![Some("0x11111111".into()), Some("0x22222222".into())];
-        set_plug(&mut document, 0, "kinetic", 0, &defaults, None).unwrap();
+        let item = document.pointer_mut("/state/characters/0/equipment/kinetic").unwrap();
+        set_item_plug(item, 0, &defaults, None).unwrap();
         assert_eq!(
             document.pointer("/state/characters/0/equipment/kinetic/plugs"),
             Some(&serde_json::json!([Value::Null, "0x22222222"]))

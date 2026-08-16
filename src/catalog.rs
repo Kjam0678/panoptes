@@ -143,6 +143,7 @@ pub struct Catalog {
     sources: HashMap<u64, String>,
     cosmetic_pools: HashMap<u32, CosmeticKind>,
     masterwork_pools: std::collections::HashSet<u32>,
+    catalyst_pools: std::collections::HashSet<u32>,
 }
 
 /// What a cosmetic socket holds. Items do not agree on the order they list
@@ -163,6 +164,14 @@ pub enum CosmeticKind {
     Shader,
 }
 
+impl CosmeticKind {
+    /// Where this sits among the cosmetics of a row. Declaration order is the
+    /// draw order, with the shader last.
+    pub fn order(self) -> u16 {
+        self as u16
+    }
+}
+
 /// The mod socket introduced with Armor 2.0.
 const ARMOR_MOD_SOCKET: u16 = 643;
 
@@ -172,6 +181,11 @@ const ARMOR_MOD_SOCKET: u16 = 643;
 /// instead of 377. Frames share names across weapon classes and behave
 /// differently on each, so plugs from these sockets say where they come from.
 const INTRINSIC_SOCKET_TYPES: [u16; 4] = [176, 14, 377, 677];
+
+/// What else a piece can be built around, where it has no intrinsic: the
+/// Year-1 armor archetype that names the piece's stat bent, and the glow
+/// socket that is all a Solstice piece carries.
+const ANCHOR_SOCKET_TYPES: [u16; 2] = [547, 467];
 
 /// Mod sockets, whose plugs this build almost entirely ships without art:
 /// Armor 2.0's general, slot-specific, and seasonal mods, then the weapon mod
@@ -196,6 +210,10 @@ const COSMETIC_SOCKET_TYPES: [u16; 1] = [746];
 const LOOKS_SOCKET_TYPES: [(u16, CosmeticKind); 2] =
     [(519, CosmeticKind::Projection), (535, CosmeticKind::Radiance)];
 
+/// The sockets that carry an exotic armor piece's trait: the Year-1 one, and
+/// the Armor 2.0 socket that reprised it.
+const EXOTIC_TRAIT_SOCKET_TYPES: [u16; 2] = [377, 677];
+
 /// The damage-mod sockets a Red War-era weapon carries beside its perks: the
 /// elemental ones a Year-1 energy weapon has, and the kinetic and attack mods
 /// of its kinetic counterpart. Sword blade sockets (67) are perks and stay
@@ -214,7 +232,13 @@ const ENERGY_SOCKET_TYPES: [u16; 2] = [678, 679];
 /// from a bare "Masterwork" through "Crucible Masterwork" and "Masterwork
 /// Upgrade" to "Masterwork Armor", hence the substring.
 fn is_masterwork_marker(name: &str) -> bool {
-    name.contains("Masterwork") || name == "Empty Catalyst Socket" || name.ends_with(" Catalyst")
+    name.contains("Masterwork") || is_catalyst_marker(name)
+}
+
+/// A catalyst belongs to one exotic weapon and nothing else, which is how an
+/// exotic is recognised here: the snapshot carries no rarity of its own.
+fn is_catalyst_marker(name: &str) -> bool {
+    name == "Empty Catalyst Socket" || name.ends_with(" Catalyst")
 }
 
 /// A pool holding one of these is a cosmetic pool: shaders, ornaments, and
@@ -324,6 +348,15 @@ impl Catalog {
             })
             .filter_map(|(index, _)| u32::try_from(index).ok())
             .collect();
+        let catalyst_pools: std::collections::HashSet<u32> = plug_pools
+            .iter()
+            .enumerate()
+            .filter(|(_, pool)| {
+                pool.iter()
+                    .any(|hash| names.get(hash).is_some_and(|name| is_catalyst_marker(name)))
+            })
+            .filter_map(|(index, _)| u32::try_from(index).ok())
+            .collect();
         let sources = intrinsic_sources(&items, &names, &plug_pools);
         Ok(Self {
             items,
@@ -340,6 +373,7 @@ impl Catalog {
             sources,
             cosmetic_pools,
             masterwork_pools,
+            catalyst_pools,
         })
     }
 
@@ -404,6 +438,40 @@ impl Catalog {
             .iter()
             .find_map(|(socket_type, kind)| (*socket_type == socket.socket_type).then_some(*kind))
             .or_else(|| self.cosmetic_pools.get(&socket.pool).copied())
+    }
+
+    /// Whether an item looks exotic. The snapshot has no rarity in it, so this
+    /// reads what the item is built out of: a catalyst socket belongs to an
+    /// exotic weapon, and the trait sockets to exotic armor. An exotic that
+    /// shipped without either is missed, which is fine where this is used.
+    pub fn is_exotic(&self, item: &ItemDef) -> bool {
+        item.sockets.iter().any(|socket| {
+            self.catalyst_pools.contains(&socket.pool)
+                || EXOTIC_TRAIT_SOCKET_TYPES.contains(&socket.socket_type)
+        })
+    }
+
+    /// Whether a socket holds what a piece is built around: a weapon's frame,
+    /// an armor archetype, an exotic's trait.
+    pub fn is_intrinsic_socket(&self, item: &ItemDef, socket_index: usize) -> bool {
+        item.sockets
+            .get(socket_index)
+            .is_some_and(|socket| INTRINSIC_SOCKET_TYPES.contains(&socket.socket_type))
+    }
+
+    /// Whether a socket is the next best thing to an intrinsic: what the piece
+    /// is built around, when it has no intrinsic of its own.
+    pub fn is_anchor_socket(&self, item: &ItemDef, socket_index: usize) -> bool {
+        item.sockets
+            .get(socket_index)
+            .is_some_and(|socket| ANCHOR_SOCKET_TYPES.contains(&socket.socket_type))
+    }
+
+    /// Whether a socket takes a mod rather than a perk.
+    pub fn is_mod_socket(&self, item: &ItemDef, socket_index: usize) -> bool {
+        item.sockets
+            .get(socket_index)
+            .is_some_and(|socket| MOD_SOCKET_TYPES.contains(&socket.socket_type))
     }
 
     /// Whether a socket sets an Armor 2.0 piece's energy type.
@@ -838,6 +906,11 @@ mod tests {
         );
     }
 }
+
+
+
+
+
 
 
 

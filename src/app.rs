@@ -341,6 +341,9 @@ impl App {
         ui.separator();
 
         let character = self.character;
+        // Every page writes to the document unless the loadout says its change
+        // was to an item held outside it.
+        self.loadout.edited_document = true;
         let mut page = loadout::Page {
             document: &mut document.value,
             catalog: &self.catalog,
@@ -356,7 +359,7 @@ impl App {
             }
         });
         if let Some(change) = change {
-            document.dirty |= change.is_ok();
+            document.dirty |= change.is_ok() && self.loadout.edited_document;
             self.report(change);
         }
     }
