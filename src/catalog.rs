@@ -141,7 +141,26 @@ pub struct Catalog {
     stat_plugs: HashMap<u64, String>,
     mod_plugs: std::collections::HashSet<u64>,
     sources: HashMap<u64, String>,
-    cosmetic_pools: std::collections::HashSet<u32>,
+    cosmetic_pools: HashMap<u32, CosmeticKind>,
+    masterwork_pools: std::collections::HashSet<u32>,
+}
+
+/// What a cosmetic socket holds. Items do not agree on the order they list
+/// these in, so the cosmetics row is sorted by kind rather than socket index —
+/// declaration order here is the order the row draws them in, with the shader
+/// last so that it ends every piece of gear.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum CosmeticKind {
+    Tracker,
+    Ornament,
+    /// The glow a handful of this build's weapons carry.
+    Radiance,
+    /// A ghost's projection.
+    Projection,
+    /// A cosmetic socket with no marker plug of its own, such as a clan
+    /// banner's staff.
+    Other,
+    Shader,
 }
 
 /// The mod socket introduced with Armor 2.0.
@@ -170,13 +189,46 @@ const STAT_SOCKET_TYPES: [u16; 5] = [676, 760, 761, 762, 763];
 /// staff is chosen the way a shader is.
 const COSMETIC_SOCKET_TYPES: [u16; 1] = [746];
 
+/// Sockets that only change how a piece looks but ship no marker plug, so the
+/// pool scan below cannot find them: a ghost's projection, and the radiance
+/// eleven weapons in this build carry. The loadout row groups these with the
+/// shaders and ornaments even though their plugs are not cosmetic pools.
+const LOOKS_SOCKET_TYPES: [(u16, CosmeticKind); 2] =
+    [(519, CosmeticKind::Projection), (535, CosmeticKind::Radiance)];
+
+/// The damage-mod sockets a Red War-era weapon carries beside its perks: the
+/// elemental ones a Year-1 energy weapon has, and the kinetic and attack mods
+/// of its kinetic counterpart. Sword blade sockets (67) are perks and stay
+/// where they are.
+const DAMAGE_MOD_SOCKET_TYPES: [u16; 2] = [68, 69];
+
+/// Armor 2.0's energy socket, which sets the element the piece's mods draw on.
+/// It is the closest thing armor has to a weapon's intrinsic, so the loadout
+/// row leads with it. A Year-1 piece has none.
+const ENERGY_SOCKET_TYPES: [u16; 2] = [678, 679];
+
+/// A masterwork or catalyst socket, recognised by what its pool holds: this
+/// build spreads them over two hundred socket types — one per exotic catalyst,
+/// and a Red War-era block of their own for the weapon masterworks that came
+/// before the single 483 socket — so the type is no use here. The names run
+/// from a bare "Masterwork" through "Crucible Masterwork" and "Masterwork
+/// Upgrade" to "Masterwork Armor", hence the substring.
+fn is_masterwork_marker(name: &str) -> bool {
+    name.contains("Masterwork") || name == "Empty Catalyst Socket" || name.ends_with(" Catalyst")
+}
+
 /// A pool holding one of these is a cosmetic pool: shaders, ornaments, and
 /// trackers each ship a "default" or disabled plug alongside their choices.
 /// Everything in such a pool belongs only to its own socket, so it is kept out
 /// of the gear-type list — you would not plug a gun skin into a perk slot.
-fn is_cosmetic_marker(name: &str) -> bool {
-    matches!(name, "Default Shader" | "Default Ornament" | "Tracker Disabled")
-        || name.contains("Kill Tracker")
+fn cosmetic_marker(name: &str) -> Option<CosmeticKind> {
+    match name {
+        "Default Shader" => Some(CosmeticKind::Shader),
+        "Default Ornament" => Some(CosmeticKind::Ornament),
+        "Tracker Disabled" => Some(CosmeticKind::Tracker),
+        _ if name.contains("Kill Tracker") => Some(CosmeticKind::Tracker),
+        _ => None,
+    }
 }
 
 impl Catalog {
@@ -193,24 +245,23 @@ impl Catalog {
         let stat_plugs: HashMap<u64, String> = serde_json::from_slice(STAT_PLUGS_JSON)
             .map_err(|error| format!("The bundled stat plug names are invalid: {error}"))?;
 
-        let mut cosmetic_pools: std::collections::HashSet<u32> = plug_pools
+        let mut cosmetic_pools: HashMap<u32, CosmeticKind> = plug_pools
             .iter()
             .enumerate()
-            .filter(|(_, pool)| {
-                pool.iter()
-                    .any(|hash| names.get(hash).is_some_and(|name| is_cosmetic_marker(name)))
+            .filter_map(|(index, pool)| {
+                let kind = pool
+                    .iter()
+                    .find_map(|hash| names.get(hash).and_then(|name| cosmetic_marker(name)))?;
+                Some((u32::try_from(index).ok()?, kind))
             })
-            .filter_map(|(index, _)| u32::try_from(index).ok())
             .collect();
-        cosmetic_pools.extend(
-            items
-                .iter()
-                .flat_map(|item| item.sockets.iter())
-                .filter(|socket| COSMETIC_SOCKET_TYPES.contains(&socket.socket_type))
-                .map(|socket| socket.pool),
-        );
+        for socket in items.iter().flat_map(|item| item.sockets.iter()) {
+            if COSMETIC_SOCKET_TYPES.contains(&socket.socket_type) {
+                cosmetic_pools.entry(socket.pool).or_insert(CosmeticKind::Other);
+            }
+        }
         let cosmetic: std::collections::HashSet<u64> = cosmetic_pools
-            .iter()
+            .keys()
             .filter_map(|index| plug_pools.get(*index as usize))
             .flatten()
             .copied()
@@ -264,6 +315,15 @@ impl Catalog {
             .flatten()
             .copied()
             .collect();
+        let masterwork_pools: std::collections::HashSet<u32> = plug_pools
+            .iter()
+            .enumerate()
+            .filter(|(_, pool)| {
+                pool.iter()
+                    .any(|hash| names.get(hash).is_some_and(|name| is_masterwork_marker(name)))
+            })
+            .filter_map(|(index, _)| u32::try_from(index).ok())
+            .collect();
         let sources = intrinsic_sources(&items, &names, &plug_pools);
         Ok(Self {
             items,
@@ -279,6 +339,7 @@ impl Catalog {
             mod_plugs,
             sources,
             cosmetic_pools,
+            masterwork_pools,
         })
     }
 
@@ -330,7 +391,48 @@ impl Catalog {
     pub fn is_cosmetic_socket(&self, item: &ItemDef, socket_index: usize) -> bool {
         item.sockets
             .get(socket_index)
-            .is_some_and(|socket| self.cosmetic_pools.contains(&socket.pool))
+            .is_some_and(|socket| self.cosmetic_pools.contains_key(&socket.pool))
+    }
+
+    /// What a socket holds for the purpose of laying the loadout row out, or
+    /// `None` for a socket that belongs with the functional ones. A projection
+    /// or a radiance joins the cosmetics here without counting as one
+    /// elsewhere: both are real sockets the game lists plugs for, not skins.
+    pub fn cosmetic_kind(&self, item: &ItemDef, socket_index: usize) -> Option<CosmeticKind> {
+        let socket = item.sockets.get(socket_index)?;
+        LOOKS_SOCKET_TYPES
+            .iter()
+            .find_map(|(socket_type, kind)| (*socket_type == socket.socket_type).then_some(*kind))
+            .or_else(|| self.cosmetic_pools.get(&socket.pool).copied())
+    }
+
+    /// Whether a socket sets an Armor 2.0 piece's energy type.
+    pub fn is_energy_socket(&self, item: &ItemDef, socket_index: usize) -> bool {
+        item.sockets
+            .get(socket_index)
+            .is_some_and(|socket| ENERGY_SOCKET_TYPES.contains(&socket.socket_type))
+    }
+
+    /// Whether a socket belongs on the second row rather than among the perks
+    /// or mods: a Red War damage mod, or one of the many sockets this build
+    /// ships with no plugs at all, which have nothing to choose from. Year-1
+    /// armor carries up to five of the empty ones.
+    pub fn is_secondary_socket(&self, item: &ItemDef, socket_index: usize) -> bool {
+        let Some(socket) = item.sockets.get(socket_index) else {
+            return false;
+        };
+        DAMAGE_MOD_SOCKET_TYPES.contains(&socket.socket_type)
+            || self
+                .plug_pools
+                .get(socket.pool as usize)
+                .is_none_or(Vec::is_empty)
+    }
+
+    /// Whether a socket holds a masterwork or, on an exotic, its catalyst.
+    pub fn is_masterwork_socket(&self, item: &ItemDef, socket_index: usize) -> bool {
+        item.sockets
+            .get(socket_index)
+            .is_some_and(|socket| self.masterwork_pools.contains(&socket.pool))
     }
 
     /// Which armor system a piece was built for. Armor 2.0 introduced the mod
@@ -646,4 +748,100 @@ mod tests {
             .expect("the catalog must contain a shader socket");
         assert!(shaders.len() > 100);
     }
+
+    #[test]
+    fn cosmetic_sockets_are_classified_so_the_row_can_be_ordered() {
+        let catalog = Catalog::load().expect("bundled catalog must parse");
+        let kinds = |item: &ItemDef| -> Vec<CosmeticKind> {
+            (0..item.sockets.len())
+                .filter_map(|index| catalog.cosmetic_kind(item, index))
+                .collect()
+        };
+        // Weapons carrying all three list them in an order the loadout row has
+        // to correct; if the catalog ever agreed with the row, the sort there
+        // would be dead weight.
+        let full: Vec<Vec<CosmeticKind>> = catalog
+            .items
+            .iter()
+            .map(kinds)
+            .filter(|kinds| {
+                [CosmeticKind::Tracker, CosmeticKind::Ornament, CosmeticKind::Shader]
+                    .iter()
+                    .all(|kind| kinds.contains(kind))
+            })
+            .collect();
+        assert!(!full.is_empty(), "no item carries all three cosmetic kinds");
+        assert!(
+            full.iter().any(|kinds| !kinds.is_sorted()),
+            "no item lists its cosmetics out of tracker/ornament/shader order"
+        );
+
+        // A ghost's projection joins the cosmetics for layout only: it is not a
+        // cosmetic pool, so it keeps its place in the plug lists.
+        let ghost = catalog
+            .items
+            .iter()
+            .find(|item| Some(item.bucket_hash) == slot_bucket("ghost") && item.sockets.len() > 3)
+            .expect("the catalog must contain a socketed ghost");
+        let projection = (0..ghost.sockets.len())
+            .find(|index| catalog.cosmetic_kind(ghost, *index) == Some(CosmeticKind::Projection))
+            .expect("a ghost must have a projection socket");
+        assert!(!catalog.is_cosmetic_socket(ghost, projection));
+    }
+
+    #[test]
+    fn only_armor_two_point_oh_has_an_energy_socket_and_only_one() {
+        let catalog = Catalog::load().expect("bundled catalog must parse");
+        let mut modern = 0;
+        for item in &catalog.items {
+            let energy = (0..item.sockets.len())
+                .filter(|index| catalog.is_energy_socket(item, *index))
+                .count();
+            // The row leads with this socket, so a second one would be dropped
+            // in among the mods with nothing marking it.
+            assert!(energy <= 1, "{} has two energy sockets", item.name);
+            if energy == 1 {
+                modern += 1;
+                assert_eq!(
+                    catalog.armor_generation(item),
+                    Some("Armor 2.0"),
+                    "{} is not Armor 2.0 but has an energy socket",
+                    item.name
+                );
+            }
+        }
+        assert!(modern > 1000, "energy sockets stopped being recognised");
+    }
+
+    #[test]
+    fn a_weapon_has_at_most_one_masterwork_or_catalyst_socket() {
+        let catalog = Catalog::load().expect("bundled catalog must parse");
+        let weapons = || {
+            catalog
+                .items
+                .iter()
+                .filter(|item| gear_kind(item.bucket_hash) == GearKind::Weapon)
+        };
+        let masterworks = |item: &ItemDef| {
+            (0..item.sockets.len())
+                .filter(|index| catalog.is_masterwork_socket(item, *index))
+                .count()
+        };
+        // The row hangs this socket under the intrinsic, which only works while
+        // there is one of it.
+        for item in weapons() {
+            assert!(masterworks(item) <= 1, "{} has two masterwork sockets", item.name);
+        }
+        assert!(
+            weapons().filter(|item| masterworks(item) == 1).count() > 100,
+            "masterwork sockets stopped being recognised"
+        );
+    }
 }
+
+
+
+
+
+
+

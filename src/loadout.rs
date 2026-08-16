@@ -29,6 +29,10 @@ const DETAIL_FONT: f32 = 13.0;
 const PICKER_WIDTH: f32 = 580.0;
 const PICKER_HEIGHT: f32 = 470.0;
 const MAX_PICKER_ROWS: usize = 300;
+/// Sockets across when they are not grouped, so a piece with eleven of them
+/// wraps at a predictable width instead of stretching the panel. Rows after
+/// the first start a column in and so hold one fewer.
+const SOCKETS_PER_ROW: usize = 6;
 /// What Sunrise ships characters at in this build.
 const DEFAULT_ITEM_LEVEL: i64 = 106;
 
@@ -40,7 +44,7 @@ const GENDERS: &[(u64, &str)] = &[(0, "Male"), (1, "Female")];
 pub struct LoadoutState {
     pub filter: PlugFilter,
     pub show_dummy_items: bool,
-    pub group_cosmetics: bool,
+    pub group_sockets: bool,
     searches: HashMap<egui::Id, String>,
 }
 
@@ -49,9 +53,9 @@ impl Default for LoadoutState {
         Self {
             filter: PlugFilter::default(),
             show_dummy_items: false,
-            // Shaders and ornaments sit apart from the sockets that change how
-            // an item plays, which is what most edits are after.
-            group_cosmetics: true,
+            // Sockets that change how an item plays lead the row; the ones that
+            // only change how it looks follow. Most edits are after the former.
+            group_sockets: true,
             searches: HashMap::new(),
         }
     }
@@ -75,6 +79,31 @@ struct Picker<'a> {
     current: Option<u64>,
     allow_empty: bool,
     icon: f32,
+}
+
+/// One line of a piece's sockets. Segments are drawn left to right with a
+/// separator between them, and an indented row starts under the second socket
+/// of the first row rather than under the first.
+struct SocketRow {
+    indented: bool,
+    segments: Vec<Vec<usize>>,
+}
+
+impl SocketRow {
+    fn new(segments: impl IntoIterator<Item = Vec<usize>>) -> Self {
+        Self {
+            indented: false,
+            segments: segments.into_iter().filter(|segment| !segment.is_empty()).collect(),
+        }
+    }
+
+    fn indented(self) -> Self {
+        Self { indented: true, ..self }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
 }
 
 pub struct Page<'a> {
@@ -112,9 +141,9 @@ impl Page<'_> {
             ui.separator();
             ui.checkbox(&mut self.state.show_dummy_items, "Dummy items")
                 .on_hover_text("Include display-only definitions that cannot normally be obtained.");
-            ui.checkbox(&mut self.state.group_cosmetics, "Group cosmetics")
+            ui.checkbox(&mut self.state.group_sockets, "Group sockets")
                 .on_hover_text(
-                    "Move shader, ornament, and tracker sockets to the right of a divider, and split a weapon's intrinsic off from its perks. Untick to keep plain socket order.",
+                    "Lay each piece out by what its sockets do: cosmetics on a row of their own ending in the shader, a weapon's intrinsic and masterwork split off from its perks, armor's energy and stats split off from its mods. Untick to keep plain socket order.",
                 );
         });
         if self.state.filter.is_unsafe() {
@@ -214,51 +243,151 @@ impl Page<'_> {
             return change;
         }
 
-        // Functional sockets first, cosmetics after a divider; on a weapon the
-        // intrinsic is split off from the perks the same way.
-        let (functional, cosmetic): (Vec<usize>, Vec<usize>) = (0..socket_count).partition(|index| {
-            !self.state.group_cosmetics || !self.catalog.is_cosmetic_socket(&item, *index)
-        });
-        let intrinsic_break = self.state.group_cosmetics.then_some(1).filter(|_| WEAPON_SLOTS.contains(&slot));
-        // Armor's stat allocations sit apart from its mods the same way.
-        let stat_break = self.state.group_cosmetics.then(|| {
-            functional
-                .iter()
-                .position(|index| self.catalog.is_stat_socket(&item, *index))
-        }).flatten();
+        let rows = self.socket_rows(&item, slot, socket_count);
+        let last_row = rows.len().saturating_sub(1);
 
         ui.add_space(4.0);
-        ui.horizontal_wrapped(|ui| {
-            for (position, socket_index) in functional.iter().copied().enumerate() {
-                if Some(position) == intrinsic_break || Some(position) == stat_break {
-                    ui.separator();
+        // Where the first row's second socket starts, so that an indented row
+        // lines up with it rather than with the socket leading the piece.
+        let mut indent = 0.0;
+        for (row_index, row) in rows.iter().enumerate() {
+            ui.horizontal_wrapped(|ui| {
+                let left = ui.cursor().left();
+                if row.indented {
+                    ui.add_space(indent);
                 }
-                let current = plugs.get(socket_index).and_then(parse_unsigned_value);
-                if let Some(socket_change) =
-                    self.draw_socket(ui, character, slot, &item, socket_index, current)
-                {
-                    change = Some(socket_change);
+                let mut column = 0;
+                for (position, segment) in row.segments.iter().enumerate() {
+                    if position > 0 {
+                        ui.separator();
+                    }
+                    for socket_index in segment.iter().copied() {
+                        if row_index == 0 && column == 1 {
+                            indent = ui.cursor().left() - left;
+                        }
+                        let current = plugs.get(socket_index).and_then(parse_unsigned_value);
+                        if let Some(socket_change) =
+                            self.draw_socket(ui, character, slot, &item, socket_index, current)
+                        {
+                            change = Some(socket_change);
+                        }
+                        column += 1;
+                    }
                 }
-            }
-            if !cosmetic.is_empty() {
-                ui.separator();
-            }
-            for socket_index in cosmetic {
-                let current = plugs.get(socket_index).and_then(parse_unsigned_value);
-                if let Some(socket_change) =
-                    self.draw_socket(ui, character, slot, &item, socket_index, current)
-                {
-                    change = Some(socket_change);
+                if row_index == last_row && native_defaults {
+                    ui.label(egui::RichText::new("package defaults").weak().small())
+                        .on_hover_text(
+                            "This item has no authored plug list yet, so its defaults are shown.",
+                        );
                 }
-            }
-            if native_defaults {
-                ui.label(egui::RichText::new("package defaults").weak().small())
-                    .on_hover_text(
-                        "This item has no authored plug list yet, so its defaults are shown.",
-                    );
-            }
-        });
+            });
+        }
         change
+    }
+
+    // -------------------------------------------------------- socket layout
+
+    /// How a piece's sockets fall into rows, which depends on the gear type:
+    /// a weapon leads with its intrinsic and hangs its masterwork underneath,
+    /// armor leads with its energy socket and puts its stats on the next row,
+    /// and everything else fits on one row with its cosmetics pushed right.
+    fn socket_rows(&self, item: &ItemDef, slot: &str, socket_count: usize) -> Vec<SocketRow> {
+        let (functional, mut cosmetic): (Vec<usize>, Vec<usize>) =
+            (0..socket_count).partition(|index| {
+                !self.state.group_sockets || self.catalog.cosmetic_kind(item, *index).is_none()
+            });
+        // Tracker, ornament, projection, then the shader that ends every row,
+        // whatever order the item lists them in. The sort is stable, so
+        // anything unclassified keeps its socket order.
+        cosmetic.sort_by_key(|index| self.catalog.cosmetic_kind(item, *index));
+
+        let mut rows = if !self.state.group_sockets {
+            ungrouped_rows(&functional)
+        } else if WEAPON_SLOTS.contains(&slot) {
+            self.weapon_rows(item, functional, cosmetic)
+        } else if ARMOR_SLOTS.contains(&slot) {
+            self.armor_rows(item, functional, cosmetic)
+        } else if slot == "ship" {
+            // A ship's shader is one of two sockets, so a separator before it
+            // would be more furniture than the row can carry.
+            vec![SocketRow::new([functional.into_iter().chain(cosmetic).collect()])]
+        } else {
+            vec![SocketRow::new([functional, cosmetic])]
+        };
+        rows.retain(|row| !row.is_empty());
+        rows
+    }
+
+    fn weapon_rows(
+        &self,
+        item: &ItemDef,
+        functional: Vec<usize>,
+        cosmetic: Vec<usize>,
+    ) -> Vec<SocketRow> {
+        let (masterwork, perks): (Vec<usize>, Vec<usize>) = functional
+            .into_iter()
+            .partition(|index| self.catalog.is_masterwork_socket(item, *index));
+        // A Red War damage mod, or a socket with nothing in it, keeps the
+        // masterwork company rather than crowding the perks.
+        let (secondary, perks): (Vec<usize>, Vec<usize>) = perks
+            .into_iter()
+            .partition(|index| self.catalog.is_secondary_socket(item, *index));
+        let [intrinsic, rest] = lead_with(perks, 0);
+        let perk_row = SocketRow::new([intrinsic, rest]);
+
+        // Only the masterwork and the sockets beside it sit under the
+        // intrinsic; anything below them lines up with the perks.
+        if !secondary.is_empty() {
+            return vec![
+                perk_row,
+                SocketRow::new([masterwork, secondary]),
+                SocketRow::new([cosmetic]).indented(),
+            ];
+        }
+        let under_intrinsic = !masterwork.is_empty();
+        let below = SocketRow::new([masterwork, cosmetic]);
+        vec![perk_row, if under_intrinsic { below } else { below.indented() }]
+    }
+
+    fn armor_rows(
+        &self,
+        item: &ItemDef,
+        functional: Vec<usize>,
+        cosmetic: Vec<usize>,
+    ) -> Vec<SocketRow> {
+        let (stats, mut mods): (Vec<usize>, Vec<usize>) = functional
+            .into_iter()
+            .partition(|index| self.catalog.is_stat_socket(item, *index));
+        // Year-1 armor pads itself out with sockets that hold nothing; an Aeon
+        // piece has five and would run to eleven across. Only as many drop to
+        // the row below as the width demands, since the first of them carries
+        // the Aeon perk and belongs beside the mods.
+        let mut spilled = Vec::new();
+        while mods.len() > SOCKETS_PER_ROW {
+            let Some(last) = mods
+                .iter()
+                .rposition(|index| self.catalog.is_secondary_socket(item, *index))
+            else {
+                break;
+            };
+            spilled.insert(0, mods.remove(last));
+        }
+        // Armor 2.0's energy socket leads the row the way a weapon's intrinsic
+        // does, since it decides what the mods beside it can be. A Year-1 piece
+        // has none and leads with the armor archetype it lists first.
+        let lead = mods
+            .iter()
+            .position(|index| self.catalog.is_energy_socket(item, *index))
+            .unwrap_or_default();
+        let [energy, rest] = lead_with(mods, lead);
+        vec![
+            SocketRow::new([energy, rest]),
+            // Spilled sockets run straight into the stats: both are the same
+            // kind of afterthought, and a divider would read as a boundary
+            // that is not there.
+            SocketRow::new([spilled.into_iter().chain(stats).collect()]).indented(),
+            SocketRow::new([cosmetic]).indented(),
+        ]
     }
 
     /// The item's level, which Sunrise stores per equipped item and which the
@@ -943,9 +1072,24 @@ fn truncated(
     ui.fonts(|fonts| fonts.layout_job(job))
 }
 
-/// Right-clicking anything with a hash offers both forms of it: the hex Sunrise
-/// writes into settings.json, and the decimal the Bungie API and the community
-/// databases use.
+/// Plain socket order, six across. Rows below the first start a column in and
+/// so hold one fewer, which is what keeps the widest gear to two rows.
+fn ungrouped_rows(sockets: &[usize]) -> Vec<SocketRow> {
+    let (first, rest) = sockets.split_at(sockets.len().min(SOCKETS_PER_ROW));
+    std::iter::once(SocketRow::new([first.to_vec()]))
+        .chain(
+            rest.chunks(SOCKETS_PER_ROW - 1)
+                .map(|chunk| SocketRow::new([chunk.to_vec()]).indented()),
+        )
+        .collect()
+}
+
+/// Splits the socket that leads a row off from the rest, in order.
+fn lead_with(mut sockets: Vec<usize>, lead: usize) -> [Vec<usize>; 2] {
+    let head = (lead < sockets.len()).then(|| sockets.remove(lead));
+    [head.into_iter().collect(), sockets]
+}
+
 fn hash_menu(response: &egui::Response, hash: Option<u64>) {
     let Some(hash) = hash else {
         return;

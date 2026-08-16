@@ -735,7 +735,9 @@ pub fn run() -> eframe::Result {
         "Panoptes",
         options,
         Box::new(move |cc| {
-            cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            // A preference, not just the current visuals: eframe otherwise
+            // follows the desktop and would flip the window to light mode.
+            cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
             Ok(Box::new(App::new(catalog)))
         }),
     )
