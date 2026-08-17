@@ -9,7 +9,9 @@ mod loadout;
 mod model;
 mod paths;
 mod settings;
+mod status;
 mod storage;
+mod theme;
 
 fn main() -> eframe::Result {
     app::run()

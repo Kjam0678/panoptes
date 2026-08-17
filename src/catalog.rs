@@ -8,7 +8,7 @@ use serde::Deserialize;
 
 use crate::{
     dummy_items,
-    model::{ARMOR_SLOTS, WEAPON_SLOTS, format_hash, slot_bucket},
+    model::{Slot, SlotKind, format_hash},
 };
 
 const CATALOG_JSON: &[u8] = include_bytes!("../assets/catalog.json");
@@ -182,10 +182,26 @@ const ARMOR_MOD_SOCKET: u16 = 643;
 /// differently on each, so plugs from these sockets say where they come from.
 const INTRINSIC_SOCKET_TYPES: [u16; 4] = [176, 14, 377, 677];
 
-/// What else a piece can be built around, where it has no intrinsic: the
-/// Year-1 armor archetype that names the piece's stat bent, and the glow
-/// socket that is all a Solstice piece carries.
-const ANCHOR_SOCKET_TYPES: [u16; 2] = [547, 467];
+/// What a Year-1 armor piece is built around: the intrinsic proper (14), the
+/// exotic trait (377), and the archetype that names a piece's stat bent (547).
+const ARMOR_INTRINSIC_SOCKET_TYPES: [u16; 3] = [14, 377, 547];
+
+/// The glow a Solstice piece carries. There is one socket type per armor slot,
+/// and Solstice was reissued with a second set of them, so a glow is only ever
+/// found by testing the whole family: 465-469 for the first generation
+/// (Rekindled, Resplendent, Scorched) and 605-609 for the second (Drained,
+/// Majestic, Magnificent).
+const ARMOR_GLOW_SOCKET_TYPES: [u16; 10] = [465, 466, 467, 468, 469, 605, 606, 607, 608, 609];
+
+/// A Sparrow's drive.
+const VEHICLE_DRIVE_SOCKET: u16 = 61;
+
+/// A ship's transmat effect.
+const SHIP_TRANSMAT_SOCKET: u16 = 58;
+
+/// A Ghost's projection. It sits anywhere from the second socket to the sixth
+/// depending on the shell, so it is only ever found by type.
+const GHOST_PROJECTION_SOCKET: u16 = 519;
 
 /// Mod sockets, whose plugs this build almost entirely ships without art:
 /// Armor 2.0's general, slot-specific, and seasonal mods, then the weapon mod
@@ -199,9 +215,12 @@ const MOD_SOCKET_TYPES: [u16; 26] = [
 /// socket a Year-1 piece uses for the same thing.
 const STAT_SOCKET_TYPES: [u16; 5] = [676, 760, 761, 762, 763];
 
-/// Sockets that are cosmetic without shipping a marker plug: a clan banner's
-/// staff is chosen the way a shader is.
-const COSMETIC_SOCKET_TYPES: [u16; 1] = [746];
+/// A clan banner's staff, chosen the way a shader is: a cosmetic socket that
+/// ships no marker plug of its own.
+const BANNER_STAFF_SOCKET: u16 = 746;
+
+/// Sockets that are cosmetic without shipping a marker plug.
+const COSMETIC_SOCKET_TYPES: [u16; 1] = [BANNER_STAFF_SOCKET];
 
 /// Sockets that only change how a piece looks but ship no marker plug, so the
 /// pool scan below cannot find them: a ghost's projection, and the radiance
@@ -459,12 +478,60 @@ impl Catalog {
             .is_some_and(|socket| INTRINSIC_SOCKET_TYPES.contains(&socket.socket_type))
     }
 
-    /// Whether a socket is the next best thing to an intrinsic: what the piece
-    /// is built around, when it has no intrinsic of its own.
-    pub fn is_anchor_socket(&self, item: &ItemDef, socket_index: usize) -> bool {
+    /// Whether a socket holds what a Year-1 armor piece is built around.
+    pub fn is_armor_intrinsic_socket(&self, item: &ItemDef, socket_index: usize) -> bool {
+        self.socket_type_is(item, socket_index, &ARMOR_INTRINSIC_SOCKET_TYPES)
+    }
+
+    /// Whether a socket holds a Solstice piece's glow.
+    pub fn is_glow_socket(&self, item: &ItemDef, socket_index: usize) -> bool {
+        self.socket_type_is(item, socket_index, &ARMOR_GLOW_SOCKET_TYPES)
+    }
+
+    /// Whether a socket holds a Red War-era weapon's damage mod: the kinetic
+    /// one (69), or the elemental one an energy weapon carries in its place
+    /// (68).
+    pub fn is_damage_mod_socket(&self, item: &ItemDef, socket_index: usize) -> bool {
+        self.socket_type_is(item, socket_index, &DAMAGE_MOD_SOCKET_TYPES)
+    }
+
+    /// Whether a socket holds a clan banner's staff.
+    pub fn is_banner_staff_socket(&self, item: &ItemDef, socket_index: usize) -> bool {
+        self.socket_type_is(item, socket_index, &[BANNER_STAFF_SOCKET])
+    }
+
+    /// Whether a socket holds a Sparrow's drive.
+    pub fn is_vehicle_drive_socket(&self, item: &ItemDef, socket_index: usize) -> bool {
+        self.socket_type_is(item, socket_index, &[VEHICLE_DRIVE_SOCKET])
+    }
+
+    /// Whether a socket holds a ship's transmat effect.
+    pub fn is_transmat_socket(&self, item: &ItemDef, socket_index: usize) -> bool {
+        self.socket_type_is(item, socket_index, &[SHIP_TRANSMAT_SOCKET])
+    }
+
+    /// Whether a socket holds a Ghost's projection.
+    pub fn is_projection_socket(&self, item: &ItemDef, socket_index: usize) -> bool {
+        self.socket_type_is(item, socket_index, &[GHOST_PROJECTION_SOCKET])
+    }
+
+    /// A Festival of the Lost mask: one socket, and it is the whole item.
+    pub fn is_mask(&self, item: &ItemDef) -> bool {
+        item.type_name == "Mask"
+    }
+
+    /// Whether a piece was built for Armor 2.0, which is what decides whether
+    /// it has an energy socket to be built around.
+    pub fn is_modern_armor(&self, item: &ItemDef) -> bool {
+        item.sockets
+            .iter()
+            .any(|socket| socket.socket_type == ARMOR_MOD_SOCKET)
+    }
+
+    fn socket_type_is(&self, item: &ItemDef, socket_index: usize, types: &[u16]) -> bool {
         item.sockets
             .get(socket_index)
-            .is_some_and(|socket| ANCHOR_SOCKET_TYPES.contains(&socket.socket_type))
+            .is_some_and(|socket| types.contains(&socket.socket_type))
     }
 
     /// Whether a socket takes a mod rather than a perk.
@@ -507,17 +574,8 @@ impl Catalog {
     /// socket every reissue carries; a Year-1 definition of the same piece has
     /// none. `None` for anything that is not armor.
     pub fn armor_generation(&self, item: &ItemDef) -> Option<&'static str> {
-        (gear_kind(item.bucket_hash) == GearKind::Armor).then(|| {
-            if item
-                .sockets
-                .iter()
-                .any(|socket| socket.socket_type == ARMOR_MOD_SOCKET)
-            {
-                "Armor 2.0"
-            } else {
-                "Armor 1.0"
-            }
-        })
+        (gear_kind(item.bucket_hash) == GearKind::Armor)
+            .then(|| if self.is_modern_armor(item) { "Armor 2.0" } else { "Armor 1.0" })
     }
 
     /// Where an archetype plug comes from: the exotic that carries it, or the
@@ -563,11 +621,11 @@ impl Catalog {
     /// Items that can be equipped in a slot by this class.
     pub fn items_for_slot(
         &self,
-        slot: &str,
+        slot: &Slot,
         class_type: u64,
         show_dummy_items: bool,
     ) -> impl Iterator<Item = &ItemDef> {
-        let bucket = slot_bucket(slot).unwrap_or_default();
+        let bucket = slot.bucket;
         self.items.iter().filter(move |item| {
             item.bucket_hash == bucket
                 && (item.class_type == 3 || item.class_type == class_type)
@@ -671,13 +729,10 @@ fn intrinsic_sources(
 }
 
 fn gear_kind(bucket: u64) -> GearKind {
-    let bucket_of = |slots: &[&str]| slots.iter().filter_map(|slot| slot_bucket(slot)).any(|b| b == bucket);
-    if bucket_of(WEAPON_SLOTS) {
-        GearKind::Weapon
-    } else if bucket_of(ARMOR_SLOTS) {
-        GearKind::Armor
-    } else {
-        GearKind::Other(bucket)
+    match Slot::from_bucket(bucket).map(|slot| slot.kind) {
+        Some(SlotKind::Weapon) => GearKind::Weapon,
+        Some(SlotKind::Armor) => GearKind::Armor,
+        _ => GearKind::Other(bucket),
     }
 }
 
@@ -849,7 +904,10 @@ mod tests {
         let ghost = catalog
             .items
             .iter()
-            .find(|item| Some(item.bucket_hash) == slot_bucket("ghost") && item.sockets.len() > 3)
+            .find(|item| {
+                Slot::from_bucket(item.bucket_hash).is_some_and(|slot| slot.name == "ghost")
+                    && item.sockets.len() > 3
+            })
             .expect("the catalog must contain a socketed ghost");
         let projection = (0..ghost.sockets.len())
             .find(|index| catalog.cosmetic_kind(ghost, *index) == Some(CosmeticKind::Projection))
@@ -906,15 +964,3 @@ mod tests {
         );
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-

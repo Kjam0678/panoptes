@@ -1,6 +1,11 @@
 //! The application shell: file handling, navigation, and the pages that are
 //! not the loadout editor.
 
+mod cli;
+mod dialogs;
+mod document;
+mod pages;
+
 use std::path::PathBuf;
 
 use eframe::egui;
@@ -8,8 +13,16 @@ use serde_json::Value;
 
 use crate::{
     catalog::Catalog,
-    game_settings, icons::Icons, loadout, model::MAX_SETTINGS_BYTES, paths, settings,
+    game_settings,
+    icons::Icons,
+    loadout,
+    paths, settings,
+    status::Change,
+    theme,
 };
+
+use cli::check;
+use document::Document;
 
 const DISPLAY_VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 const SUNRISE_URL: &str = "https://github.com/stanuwu/Sunrise";
@@ -20,37 +33,6 @@ enum View {
     GameSettings,
     Json,
     Paths,
-}
-
-/// The loaded settings.json and everything derived from it.
-struct Document {
-    path: PathBuf,
-    value: Value,
-    persisted: Value,
-    source_warning: Option<String>,
-    raw_json: String,
-    dirty: bool,
-}
-
-impl Document {
-    fn open(path: PathBuf) -> Result<Self, String> {
-        let value = settings::load_json(&path)?;
-        Ok(Self {
-            source_warning: settings::validate_document(&value).err(),
-            raw_json: serde_json::to_string_pretty(&value).unwrap_or_default(),
-            persisted: value.clone(),
-            value,
-            path,
-            dirty: false,
-        })
-    }
-
-    fn character_count(&self) -> usize {
-        self.value
-            .pointer("/state/characters")
-            .and_then(Value::as_array)
-            .map_or(0, Vec::len)
-    }
 }
 
 pub struct App {
@@ -102,7 +84,7 @@ impl App {
     }
 
     /// Reports what a page did: a status line, or the reason it failed.
-    fn report(&mut self, change: loadout::Change) {
+    fn report(&mut self, change: Change) {
         match change {
             Ok(message) => self.set_status(message, false),
             Err(error) => self.set_status(error, true),
@@ -287,168 +269,6 @@ impl App {
             .map_or(0, Document::character_count)
     }
 
-    // ------------------------------------------------------------------ pages
-
-    fn draw_welcome(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(40.0);
-        ui.vertical_centered(|ui| {
-            ui.heading("Panoptes");
-            ui.label("A fast loadout editor for Project Sunrise on Destiny 2 Shadowkeep.");
-            ui.add_space(16.0);
-            if ui.button("Choose settings.json…").clicked() {
-                self.choose(false);
-            }
-            ui.add_space(6.0);
-            if ui.button("Choose the Destiny 2 install folder…").clicked() {
-                self.choose(true);
-            }
-            ui.add_space(16.0);
-            ui.label(
-                egui::RichText::new(format!(
-                    "Sunrise keeps its settings at {} or {}",
-                    paths::SETTINGS_LAYOUTS[0],
-                    paths::SETTINGS_LAYOUTS[1]
-                ))
-                .weak()
-                .small(),
-            );
-        });
-    }
-
-    fn draw_loadout(&mut self, ui: &mut egui::Ui) {
-        let Some(document) = self.document.as_mut() else {
-            return;
-        };
-        let tabs: Vec<(usize, String)> = document
-            .value
-            .pointer("/state/characters")
-            .and_then(Value::as_array)
-            .map(|characters| {
-                characters
-                    .iter()
-                    .enumerate()
-                    .map(|(index, character)| (index, loadout::character_tab_label(character, index)))
-                    .collect()
-            })
-            .unwrap_or_default();
-        ui.horizontal_wrapped(|ui| {
-            for (index, label) in tabs {
-                if ui.selectable_label(self.character == index, label).clicked() {
-                    self.character = index;
-                }
-            }
-        });
-        ui.separator();
-
-        let character = self.character;
-        // Every page writes to the document unless the loadout says its change
-        // was to an item held outside it.
-        self.loadout.edited_document = true;
-        let mut page = loadout::Page {
-            document: &mut document.value,
-            catalog: &self.catalog,
-            icons: &mut self.icons,
-            state: &mut self.loadout,
-        };
-        let mut change = None;
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            change = page.draw_character_fields(ui, character);
-            ui.add_space(10.0);
-            if let Some(equipment_change) = page.draw_equipment(ui, character) {
-                change = Some(equipment_change);
-            }
-        });
-        if let Some(change) = change {
-            document.dirty |= change.is_ok() && self.loadout.edited_document;
-            self.report(change);
-        }
-    }
-
-    fn draw_paths(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Paths");
-        ui.add_space(8.0);
-        egui::Grid::new("paths")
-            .num_columns(3)
-            .spacing([12.0, 10.0])
-            .show(ui, |ui| {
-                ui.label("Sunrise settings");
-                ui.monospace(
-                    self.document
-                        .as_ref()
-                        .map_or_else(|| "None selected".to_owned(), |document| document.path.display().to_string()),
-                );
-                if ui.button("Choose…").clicked() {
-                    self.choose(false);
-                }
-                ui.end_row();
-                ui.label("Settings schema");
-                ui.monospace(
-                    self.document
-                        .as_ref()
-                        .and_then(|document| game_settings::schema_version(&document.value))
-                        .map_or_else(|| "Missing or invalid".to_owned(), |version| version.to_string()),
-                );
-                ui.end_row();
-                ui.label("Save size limit");
-                ui.monospace(format!("{MAX_SETTINGS_BYTES} bytes"));
-                ui.end_row();
-                ui.label("Backups");
-                ui.monospace(
-                    paths::backup_dir()
-                        .map_or_else(|| "Unavailable".to_owned(), |dir| dir.display().to_string()),
-                );
-                ui.end_row();
-                ui.label("Icons");
-                ui.monospace(format!("{} compiled in", Icons::packed()));
-                ui.end_row();
-                ui.label("Catalog");
-                ui.monospace(format!("{} bundled items (build 86657.20.08.23)", self.catalog.items.len()));
-                ui.end_row();
-            });
-
-        ui.add_space(18.0);
-        ui.separator();
-        ui.add_space(10.0);
-        ui.heading("Restore a backup");
-        ui.label("Replace the current settings.json with an earlier backup. The current file is copied to settings.json.bak first.");
-        if ui
-            .add_enabled(self.document.is_some(), egui::Button::new("Restore a backup…"))
-            .clicked()
-        {
-            self.restore_confirmation_open = true;
-        }
-    }
-
-    fn draw_json(&mut self, ui: &mut egui::Ui) {
-        let mut apply = false;
-        let mut reset = false;
-        ui.horizontal(|ui| {
-            ui.heading("All settings");
-            apply = ui.button("Apply JSON").clicked();
-            reset = ui.button("Reset editor").clicked();
-        });
-        ui.label("Edit anything the guided pages do not cover, then Apply JSON. Save writes applied changes to disk.");
-        ui.add_space(6.0);
-        if let Some(document) = self.document.as_mut() {
-            egui::ScrollArea::both().show(ui, |ui| {
-                ui.add(
-                    egui::TextEdit::multiline(&mut document.raw_json)
-                        .code_editor()
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(40),
-                );
-            });
-        }
-        if apply {
-            self.apply_raw_json();
-        }
-        if reset {
-            if let Some(document) = self.document.as_mut() {
-                document.raw_json = serde_json::to_string_pretty(&document.value).unwrap_or_default();
-            }
-            self.set_status("JSON editor reset to the current settings", false);
-        }
-    }
 }
 
 impl eframe::App for App {
@@ -463,7 +283,7 @@ impl eframe::App for App {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if dirty {
-                    ui.label(egui::RichText::new("Unsaved changes").color(egui::Color32::YELLOW));
+                    ui.label(egui::RichText::new("Unsaved changes").color(theme::UNSAVED));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.add_enabled(dirty, egui::Button::new("Save")).clicked() {
@@ -519,7 +339,7 @@ impl eframe::App for App {
 
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             let color = if self.status_is_error {
-                egui::Color32::LIGHT_RED
+                theme::ERROR
             } else {
                 ui.visuals().text_color()
             };
@@ -562,140 +382,6 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
     }
-}
-
-impl App {
-    fn draw_dialogs(&mut self, ctx: &egui::Context) {
-        if self.about_open {
-            let mut open = true;
-            egui::Window::new("About Panoptes")
-                .open(&mut open)
-                .collapsible(false)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    ui.set_width(420.0);
-                    ui.vertical_centered(|ui| {
-                        ui.heading("Panoptes");
-                        ui.label(egui::RichText::new(DISPLAY_VERSION).weak());
-                    });
-                    ui.add_space(10.0);
-                    ui.label("Edits Project Sunrise's characters, loadouts, sockets, and game settings for Destiny 2 Shadowkeep build 86657.20.08.23.");
-                    ui.add_space(6.0);
-                    ui.hyperlink_to("Project Sunrise on GitHub", SUNRISE_URL);
-                    ui.add_space(10.0);
-                    ui.label(
-                        egui::RichText::new(
-                            "Not affiliated with or endorsed by Bungie Inc. or Sony Interactive Entertainment. Destiny and related intellectual property are owned by Bungie Inc. and their respective rights holders.",
-                        )
-                        .small()
-                        .weak(),
-                    );
-                });
-            self.about_open = open;
-        }
-
-        if self.reload_confirmation_open {
-            match confirm(
-                ctx,
-                "Discard unsaved changes?",
-                "Reloading discards changes that have not been saved.",
-                "Discard and reload",
-            ) {
-                Some(true) => {
-                    self.reload_confirmation_open = false;
-                    self.reload();
-                }
-                Some(false) => self.reload_confirmation_open = false,
-                None => {}
-            }
-        }
-
-        if self.restore_confirmation_open {
-            match confirm(
-                ctx,
-                "Restore a backup?",
-                "This replaces the entire settings.json. The current file is copied to settings.json.bak and to a timestamped backup first, and unsaved changes are discarded.",
-                "Choose a backup…",
-            ) {
-                Some(true) => {
-                    self.restore_confirmation_open = false;
-                    self.restore_backup();
-                }
-                Some(false) => self.restore_confirmation_open = false,
-                None => {}
-            }
-        }
-
-        if self.exit_confirmation_open {
-            let mut open = true;
-            let (mut save_and_exit, mut discard, mut cancel) = (false, false, false);
-            egui::Window::new("Unsaved changes")
-                .open(&mut open)
-                .collapsible(false)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    ui.label("Save your changes before closing?");
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        save_and_exit = ui.button("Save and exit").clicked();
-                        discard = ui.button("Discard and exit").clicked();
-                        cancel = ui.button("Cancel").clicked();
-                    });
-                });
-            self.exit_confirmation_open = open && !save_and_exit && !discard && !cancel;
-            if save_and_exit {
-                self.save();
-                if !self.document.as_ref().is_some_and(|document| document.dirty) {
-                    self.exit_confirmed = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            } else if discard {
-                self.exit_confirmed = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-        }
-    }
-}
-
-/// A modal with one confirming button; `Some(true)` confirms, `Some(false)`
-/// cancels, `None` means it is still open.
-fn confirm(ctx: &egui::Context, title: &str, body: &str, confirm_label: &str) -> Option<bool> {
-    let mut open = true;
-    let (mut confirmed, mut cancelled) = (false, false);
-    egui::Window::new(title)
-        .open(&mut open)
-        .collapsible(false)
-        .resizable(false)
-        .show(ctx, |ui| {
-            ui.set_width(460.0);
-            ui.label(body);
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                confirmed = ui.button(confirm_label).clicked();
-                cancelled = ui.button("Cancel").clicked();
-            });
-        });
-    match (confirmed, cancelled || !open) {
-        (true, _) => Some(true),
-        (false, true) => Some(false),
-        (false, false) => None,
-    }
-}
-
-/// `--check <settings.json>` validates a file without opening a window.
-fn check(path: &std::path::Path) -> Result<String, String> {
-    let document = settings::load_json(path)?;
-    settings::validate_document(&document).map_err(|error| format!("Invalid settings: {error}"))?;
-    let catalog = Catalog::load()?;
-    Ok(format!(
-        "Valid: {} characters, {} catalog items, save size {} bytes",
-        document
-            .pointer("/state/characters")
-            .and_then(Value::as_array)
-            .map_or(0, Vec::len),
-        catalog.items.len(),
-        settings::encode_settings(&document)?.len() + 1
-    ))
 }
 
 pub fn run() -> eframe::Result {

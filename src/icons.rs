@@ -36,7 +36,7 @@ pub enum Fallback {
 }
 
 pub struct Icons {
-    textures: HashMap<u64, Option<egui::TextureHandle>>,
+    textures: HashMap<u64, egui::TextureHandle>,
     unknown: Option<egui::TextureHandle>,
     unknown_mod: Option<egui::TextureHandle>,
     empty: Option<egui::TextureHandle>,
@@ -74,7 +74,7 @@ impl Icons {
     }
 
     /// The icon for a hash, or the stand-in this build has for it. `None` only
-    /// while a busy frame defers the load.
+    /// while a busy frame defers the load to the next one.
     pub fn get(
         &mut self,
         ctx: &egui::Context,
@@ -82,19 +82,21 @@ impl Icons {
         fallback: Fallback,
     ) -> Option<egui::TextureHandle> {
         if let Some(texture) = self.textures.get(&hash) {
-            return texture.clone();
+            return Some(texture.clone());
         }
         if self.budget == 0 {
             self.deferred = true;
             return None;
         }
         self.budget -= 1;
-        let texture = Some(match Self::load(ctx, hash) {
+        // A hash this build has no art for resolves to a stand-in rather than
+        // to nothing, so every hash asked for ends up with a texture.
+        let texture = match Self::load(ctx, hash) {
             Some(texture) => texture,
             None => self.stand_in(ctx, fallback),
-        });
+        };
         self.textures.insert(hash, texture.clone());
-        texture
+        Some(texture)
     }
 
     fn stand_in(&mut self, ctx: &egui::Context, fallback: Fallback) -> egui::TextureHandle {
