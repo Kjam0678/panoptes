@@ -1,6 +1,6 @@
 [package]
 name = "panoptes"
-version = "2.1.0"
+version = "3.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "GPL-3.0-only"

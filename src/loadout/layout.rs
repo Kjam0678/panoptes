@@ -187,7 +187,7 @@ impl Page<'_> {
         } else if self.catalog.is_stat_socket(item, socket) {
             RowGroup::Stat
         } else if self.catalog.is_secondary_socket(item, socket) {
-            RowGroup::Spare
+            RowGroup::Mod
         } else if slot.is_armor() || self.catalog.is_mod_socket(item, socket) {
             RowGroup::Mod
         } else {
